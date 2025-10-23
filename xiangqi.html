@@ -1,0 +1,342 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8" />
+<title>縦9×横8盤 PC1 vs PC2</title>
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<style>
+body{font-family:system-ui, sans-serif; display:flex; gap:20px; padding:20px}
+.controls{width:420px}
+.palette{display:flex; gap:6px; flex-wrap:wrap}
+.piece-btn{padding:6px 8px; border:1px solid #888; border-radius:6px; cursor:pointer}
+.selected{box-shadow:0 0 0 3px rgba(0,120,200,0.2);}
+.legend{margin-top:10px}
+.small{font-size:13px}
+.schedule-row{display:flex; gap:6px; margin-bottom:6px}
+button{cursor:pointer}
+.side-indicator{margin-top:8px; padding:6px; border-radius:6px; display:inline-block}
+</style>
+</head>
+<body>
+<div>
+  <canvas id="boardCanvas" width="448" height="504" style="border:2px solid #333; cursor:pointer"></canvas>
+</div>
+<div class="controls">
+<h2>縦9×横8盤 PC1 vs PC2</h2>
+<p class="small">左クリックで駒選択→緑で移動可能マス表示→クリックで移動。右クリックでPC2駒配置。</p>
+<div style="margin-top:8px">
+  <strong>駒パレット (PC2 配置)</strong>
+  <div class="palette" id="palette"></div>
+</div>
+<div class="legend">
+  <div><span style="display:inline-block;width:14px;height:14px;background:#104a7d;margin-right:6px"></span> PC1 (車)</div>
+  <div><span style="display:inline-block;width:14px;height:14px;background:#c22;margin-right:6px"></span> PC2 駒</div>
+  <div><span style="display:inline-block;width:14px;height:14px;background:rgba(255,0,0,0.35);margin-right:6px"></span> 危険マス（移動後に敵から取られるマス）</div>
+  <div><span style="display:inline-block;width:14px;height:14px;background:rgba(0,200,0,0.25);margin-right:6px"></span> 安全な移動マス</div>
+</div>
+<div style="margin-top:12px">
+  <button id="resetBtn">初期化</button>
+  <button id="toggleShow">危険マスの表示: ON</button>
+  <button id="skipTurn">手番スキップ</button>
+</div>
+<div style="margin-top:12px">
+  <strong>現在ターン:</strong>
+  <span id="turnOwner" class="side-indicator"></span>
+  <div style="margin-top:6px">ターン番号: <span id="turnNum">1</span></div>
+</div>
+<h3 style="margin-top:12px">PC2 スポーン予定</h3>
+<div id="scheduleList"></div>
+<div style="margin-top:6px" class="schedule-row">
+  <input id="schedTurn" type="number" value="1" style="width:70px" />
+  <select id="schedPiece"></select>
+  <input id="schedX" type="number" min="0" max="7" value="0" style="width:60px" />
+  <input id="schedY" type="number" min="0" max="8" value="0" style="width:60px" />
+  <button id="addSched">追加</button>
+</div>
+</div>
+
+<script>
+const WIDTH=8, HEIGHT=9, CELL=56;
+const canvas=document.getElementById('boardCanvas'), ctx=canvas.getContext('2d');
+const paletteEl=document.getElementById('palette');
+const schedPieceSel=document.getElementById('schedPiece');
+const scheduleListEl=document.getElementById('scheduleList');
+
+let board=[], schedules=[];
+let turnOwner='PC1', turnNumber=1, showDanger=true;
+let selected=null, selectedPalette=null;
+const pc2Types=['卒','士','象','炮','車','馬','將'];
+
+function init(){
+  paletteEl.innerHTML=''; schedPieceSel.innerHTML='';
+  pc2Types.forEach(t=>{
+    const b=document.createElement('button'); b.className='piece-btn'; b.textContent=t;
+    b.onclick=()=> selectPalette(t); paletteEl.appendChild(b);
+    const opt=document.createElement('option'); opt.value=t; opt.textContent=t; schedPieceSel.appendChild(opt);
+  });
+  resetBoard(); updateTurnDisplay(); refreshScheduleList();
+}
+
+function resetBoard(){
+  board=Array.from({length:HEIGHT}, ()=>Array(WIDTH).fill(null));
+  board[6][3]={side:'PC1',type:'車'}; // 中央
+  board[2][3]={side:'PC2',type:'卒'};
+  board[2][5]={side:'PC2',type:'卒'};
+  board[2][1]={side:'PC2',type:'卒'};
+  selected=null; renderCanvas();
+}
+
+function selectPalette(t){ selectedPalette=t; [...paletteEl.children].forEach(b=>b.classList.toggle('selected', b.textContent===t)); }
+function updateTurnDisplay(){
+  document.getElementById('turnOwner').textContent=turnOwner+'（あなた）';
+  document.getElementById('turnNum').textContent=turnNumber;
+}
+function inRange(x,y){ return x>=0 && x<WIDTH && y>=0 && y<HEIGHT; }
+
+// ========== 移動範囲 ==========
+function moveRangeFor(b,sx,sy,piece){
+  const res=[],type=piece.type;
+  const dirs={
+    '卒':[[1,0],[-1,0],[0,1],[0,-1]],
+    '將':[[1,0],[-1,0],[0,1],[0,-1]],
+    '士':[[1,1],[1,-1],[-1,1],[-1,-1]],
+    '象':[[2,2],[2,-2],[-2,2],[-2,-2]],
+    '馬':[[1,2],[2,1],[-1,2],[-2,1],[1,-2],[2,-1],[-1,-2],[-2,-1]],
+    '車':[[1,0],[-1,0],[0,1],[0,-1]],
+    '炮':[[1,0],[-1,0],[0,1],[0,-1]]
+  };
+
+  if(type!=='車' && type!=='炮'){
+    dirs[type].forEach(([dx,dy])=>{
+      const x=sx+dx,y=sy+dy;
+      if(!inRange(x,y))return;
+
+      if(type==='象'){
+        const mx=sx+dx/2,my=sy+dy/2;
+        if(!inRange(mx,my))return;
+        if(b[my][mx])return; // 象の脚塞ぎ
+      }else if(type==='馬'){
+        const mx=sx+(Math.abs(dx)===2?dx/2:0);
+        const my=sy+(Math.abs(dy)===2?dy/2:0);
+        if(!inRange(mx,my))return;
+        if(b[my][mx])return; // 馬の脚塞ぎ
+      }
+      res.push({x,y});
+    });
+    return res;
+  }
+
+  for(const[dx,dy]of dirs[type]){
+    let x=sx+dx,y=sy+dy;
+    if(type==='車'){
+      while(inRange(x,y)){
+        if(b[y][x]){res.push({x,y});break;}
+        res.push({x,y});x+=dx;y+=dy;
+      }
+    }else if(type==='炮'){
+      while(inRange(x,y)&&!b[y][x]){res.push({x,y});x+=dx;y+=dy;}
+    }
+  }
+  return res;
+}
+
+// ========== 攻撃範囲 ==========
+function attackRangeFor(b,sx,sy,piece){
+  const res=[],type=piece.type;
+  const dirs={
+    '卒':[[1,0],[-1,0],[0,1],[0,-1]],
+    '將':[[1,0],[-1,0],[0,1],[0,-1]],
+    '士':[[1,1],[1,-1],[-1,1],[-1,-1]],
+    '象':[[2,2],[2,-2],[-2,2],[-2,-2]],
+    '馬':[[1,2],[2,1],[-1,2],[-2,1],[1,-2],[2,-1],[-1,-2],[-2,-1]],
+    '車':[[1,0],[-1,0],[0,1],[0,-1]],
+    '炮':[[1,0],[-1,0],[0,1],[0,-1]]
+  };
+
+  if(type!=='車' && type!=='炮'){
+    dirs[type].forEach(([dx,dy])=>{
+      const x=sx+dx,y=sy+dy;
+      if(!inRange(x,y))return;
+
+      if(type==='象'){
+        const mx=sx+dx/2,my=sy+dy/2;
+        if(!inRange(mx,my))return;
+        if(b[my][mx])return; // 象の脚塞ぎ
+      }else if(type==='馬'){
+        const mx=sx+(Math.abs(dx)===2?dx/2:0);
+        const my=sy+(Math.abs(dy)===2?dy/2:0);
+        if(!inRange(mx,my))return;
+        if(b[my][mx])return; // 馬の脚塞ぎ
+      }
+      res.push({x,y});
+    });
+    return res;
+  }
+
+  for(const[dx,dy]of dirs[type]){
+    let x=sx+dx,y=sy+dy;
+    if(type==='車'){
+      while(inRange(x,y)){
+        if(b[y][x]){
+          if(b[y][x].side!==piece.side)res.push({x,y});
+          break;
+        }
+        res.push({x,y});x+=dx;y+=dy;
+      }
+    }else if(type==='炮'){
+      while(inRange(x,y)&&!b[y][x]){x+=dx;y+=dy;}
+      if(inRange(x,y)){
+        x+=dx;y+=dy;
+        while(inRange(x,y)){
+          if(b[y][x]){
+            if(b[y][x].side!==piece.side)res.push({x,y});
+            break;
+          }
+          x+=dx;y+=dy;
+        }
+      }
+    }
+  }
+  return res;
+}
+
+// ========== 危険マス判定 ==========
+function isSquareDangerousAfterMove(sel,sx,sy,tx,ty){
+  const origFrom=board[sy][sx];
+  const origTo=board[ty][tx];
+  board[sy][sx]=null;
+  board[ty][tx]=sel;
+  let danger=false;
+  outer:for(let y=0;y<HEIGHT;y++){
+    for(let x=0;x<WIDTH;x++){
+      const p=board[y][x];
+      if(!p||p.side!=='PC2')continue;
+      const attacks=attackRangeFor(board,x,y,p);
+      for(const a of attacks){
+        if(a.x===tx&&a.y===ty){danger=true;break outer;}
+      }
+    }
+  }
+  board[sy][sx]=origFrom;
+  board[ty][tx]=origTo;
+  return danger;
+}
+
+// ========== 描画 ==========
+function renderCanvas(){
+  ctx.clearRect(0,0,CELL*WIDTH,CELL*HEIGHT);
+  for(let y=0;y<HEIGHT;y++){
+    for(let x=0;x<WIDTH;x++){
+      ctx.fillStyle=(x+y)%2?'#cfcfcf':'#fff';
+      ctx.fillRect(x*CELL,y*CELL,CELL,CELL);
+    }
+  }
+
+  if(selected){
+    const p=board[selected.y][selected.x];
+    if(p){
+      const moves=moveRangeFor(board,selected.x,selected.y,p);
+      moves.forEach(m=>{
+        const danger=isSquareDangerousAfterMove(p,selected.x,selected.y,m.x,m.y);
+        ctx.fillStyle=danger&&showDanger?'rgba(255,0,0,0.35)':'rgba(0,200,0,0.25)';
+        ctx.fillRect(m.x*CELL,m.y*CELL,CELL,CELL);
+      });
+      ctx.fillStyle='rgba(255,230,0,0.28)';
+      ctx.fillRect(selected.x*CELL,selected.y*CELL,CELL,CELL);
+    }
+  }
+
+  ctx.font="20px sans-serif"; ctx.textAlign="center"; ctx.textBaseline="middle";
+  for(let y=0;y<HEIGHT;y++){
+    for(let x=0;x<WIDTH;x++){
+      const p=board[y][x]; if(!p)continue;
+      ctx.fillStyle=p.side==='PC1'?'#104a7d':'#c22';
+      ctx.fillText(p.type,x*CELL+CELL/2,y*CELL+CELL/2);
+    }
+  }
+  ctx.font="11px sans-serif"; ctx.fillStyle="rgba(0,0,0,0.3)";
+  for(let y=0;y<HEIGHT;y++){
+    for(let x=0;x<WIDTH;x++){
+      ctx.fillText(String.fromCharCode(65+x)+(9-y),x*CELL+CELL-10,y*CELL+CELL-4);
+    }
+  }
+}
+
+// ========== クリック処理 ==========
+canvas.addEventListener('click',e=>{
+  const rect=canvas.getBoundingClientRect();
+  const x=Math.floor((e.clientX-rect.left)/CELL);
+  const y=Math.floor((e.clientY-rect.top)/CELL);
+  onClickCell(x,y);
+});
+canvas.addEventListener('contextmenu',e=>{
+  e.preventDefault();
+  const rect=canvas.getBoundingClientRect();
+  const x=Math.floor((e.clientX-rect.left)/CELL);
+  const y=Math.floor((e.clientY-rect.top)/CELL);
+  onRightClickCell(x,y);
+});
+
+function onClickCell(x,y){
+  const p=board[y][x];
+  if(selected){
+    const selPiece=board[selected.y][selected.x];
+    if(selPiece&&selPiece.side===turnOwner){
+      const moves=moveRangeFor(board,selected.x,selected.y,selPiece).map(m=>m.x+','+m.y);
+      if(moves.includes(x+','+y)){
+        board[y][x]=selPiece; board[selected.y][selected.x]=null;
+        selected=null; advanceTurn(); return;
+      }
+    }
+  }
+  if(p&&p.side===turnOwner)selected={x,y}; else selected=null;
+  renderCanvas();
+}
+
+function onRightClickCell(x,y){
+  if(!selectedPalette){alert('右クリックでPC2の駒を選択してください');return;}
+  board[y][x]={side:'PC2',type:selectedPalette};
+  renderCanvas();
+}
+
+// ========== ターン管理 ==========
+function advanceTurn(){
+  if(turnOwner==='PC1'){
+    turnOwner='PC2';
+    const spawns=schedules.filter(s=>s.turn===turnNumber);
+    spawns.forEach(s=>{board[s.y][s.x]={side:'PC2',type:s.type};});
+    schedules=schedules.filter(s=>s.turn!==turnNumber);
+    refreshScheduleList();
+  }else{
+    turnOwner='PC1'; turnNumber++;
+  }
+  selected=null; updateTurnDisplay(); renderCanvas();
+}
+
+document.getElementById('skipTurn').onclick=()=>advanceTurn();
+document.getElementById('resetBtn').onclick=()=>{resetBoard();turnOwner='PC1';turnNumber=1;updateTurnDisplay();}
+document.getElementById('toggleShow').onclick=()=>{showDanger=!showDanger;document.getElementById('toggleShow').textContent='危険マスの表示: '+(showDanger?'ON':'OFF');renderCanvas();}
+
+function refreshScheduleList(){
+  scheduleListEl.innerHTML='';
+  schedules.sort((a,b)=>a.turn-b.turn).forEach((s,idx)=>{
+    const div=document.createElement('div');
+    div.textContent=`ターン ${s.turn}: ${s.type} を (${s.x},${s.y}) に追加`;
+    const btn=document.createElement('button');
+    btn.textContent='削除'; btn.onclick=()=>{schedules.splice(idx,1);refreshScheduleList();renderCanvas();};
+    div.appendChild(btn); scheduleListEl.appendChild(div);
+  });
+}
+document.getElementById('addSched').onclick=()=>{
+  const t=parseInt(document.getElementById('schedTurn').value,10);
+  const type=document.getElementById('schedPiece').value;
+  const x=parseInt(document.getElementById('schedX').value,10);
+  const y=parseInt(document.getElementById('schedY').value,10);
+  if(isNaN(t)||x<0||x>=WIDTH||y<0||y>=HEIGHT){alert('値が不正');return;}
+  schedules.push({turn:t,type,x,y});refreshScheduleList();renderCanvas();
+}
+
+init();
+</script>
+</body>
+</html>
